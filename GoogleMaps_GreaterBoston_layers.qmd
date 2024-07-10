@@ -1,0 +1,1477 @@
+---
+title: "Using Google Maps via R to explore Greater Boston neighborhood housing"
+subtitle: "Rendered 07/09/2024"
+author: "Jeremy M. Simon"
+format:
+  html:
+    embed-resources: true
+    toc: true
+editor: visual
+---
+
+# Background
+
+We'd like to explore housing in the greater Boston area, but given the high prices and low inventory, the number of neighborhoods each with their own characteristics, and the tricky fact that our on-site work locations are in different areas, we'd like a way to streamline our search. The goal here is to locate areas from which we can still reliably commute via public transit but also be walking distance to neighborhood points-of-interest important to us. From there, we can find housing listings that match various other search criteria.
+
+Some of this was inspired by a post [here](https://mdneuzerling.com/post/plotting-commute-times-with-r-and-google-maps/) demonstrating that plotting commute times via Google Maps API calls in `R` was possible. I wanted to add my own transit-connectivity index, based on the fact that MBTA is somewhat unreliable (thus having potential redundancy in our commute methods would be beneficial), and then compute an overall walkability score based on this and other highly rated points-of-interest within walking distance. The post linked above tiled hexagons across a map of Melbourne; instead I decided to use 2020 census blocks, and their centroids, as the unit on which most of this would be computed.
+
+Much of this is possible thanks to two `R` packages: `googleway` and `sf`. Things like calculating distances, computing centroids, intersections, etc of spatial geometries are all possible in `sf` and then interactions with the Google Maps API (e.g. getting maps navigation, or searching for points of interest) are carried out via `googleway`. `ggmap` is also worth a look as it makes maps functionality work within `ggplot2`.
+
+Lastly, I leveraged the python package [HomeHarvest](https://github.com/Bunsly/HomeHarvest) to retrieve all recent MLS listings in the area and overlay these as points on our map
+
+Note and disclaimer: Google API calls can add up quickly. When you register for an API key, review all pricing details and decide for yourself whether and how to proceed so as to not generate a massive bill. All maps images here are static, but when you plot via `googleway::google_map()` they will be interactive.
+
+# Initial setup
+
+## Load dependencies
+
+```{r }
+#| warning: false
+#| error: false
+library(googleway)
+library(tidytransit)
+library(measurements)
+library(lubridate)
+library(sf)
+library(tidyverse)
+```
+
+## Set private Google Maps API
+
+I've set mine as an environment variable so I retrieve that value here
+
+```{r}
+#api <- "your_private_api_key_here"
+api <- Sys.getenv("GOOGLE_API")
+googleway::set_key(key = api)
+```
+
+## Read Boston MBTA data via GTFS
+
+```{r}
+boston_mbta <- read_gtfs("https://cdn.mbta.com/MBTA_GTFS.zip")
+```
+
+## Set reasonable walking distances for points of interest (0.75mi) and transit (0.5mi) to meters
+
+```{r}
+max_walk_meters <- floor(measurements::conv_unit(x = 0.75,from = "mi",to="m"))
+max_walk_meters_transport <- floor(measurements::conv_unit(x = 0.5,from = "mi",to="m"))
+```
+
+# Prepare and tidy up MBTA transit data
+
+## Get all MBTA RapidTransit stops in the network, separated by T, CR, and bus
+
+```{r}
+t_stops <- boston_mbta$stops %>%
+    dplyr::filter(zone_id == "RapidTransit") %>%
+    dplyr::select(stop_id,stop_name,stop_lat,stop_lon) %>%
+    dplyr::distinct(stop_id, .keep_all = TRUE)
+
+t_stops
+
+cr_stops <- boston_mbta$stops %>%
+	dplyr::filter(zone_id == "CR-zone-1A") %>%
+    dplyr::select(stop_id,stop_name,stop_lat,stop_lon) %>%
+    dplyr::distinct(stop_id, .keep_all = TRUE)
+
+cr_stops
+
+bus_stops <- boston_mbta$stops %>%
+    dplyr::filter(zone_id == "LocalBus" | zone_id == "ExpressBus-Downtown") %>%
+    dplyr::select(stop_id,stop_name,stop_lat,stop_lon) %>%
+    dplyr::distinct(stop_id, .keep_all = TRUE)
+
+bus_stops
+```
+
+## Create lookup function to pull together stop names and lines
+
+Which transit stops are on which lines is not as easily linked as I expected, though it is all present in the GTFS feed. I perform a series of joins using the logic described [here](https://www.adventuremeng.com/post/tidytransit-linking-gtfs-stop-ids-and-routes/), though my approach was a bit different
+
+```{r}
+stop_route_lookup <- full_join(boston_mbta$routes,boston_mbta$trips) %>%
+	full_join(boston_mbta$stop_times) %>%
+	full_join(boston_mbta$stops) %>%
+	dplyr::select(trip_id, route_id, shape_id, stop_id)	%>%
+	distinct()
+```
+
+## Annotate T stops with Lines, then create walking distance buffer around each stop
+
+```{r}
+t_stops_withLines <- full_join(t_stops,stop_route_lookup,by="stop_id") %>% 
+	dplyr::select(-stop_id,-trip_id,-shape_id) %>% 
+	as_tibble() %>% 
+	drop_na(route_id) %>%
+	drop_na(stop_lat) %>%
+	dplyr::filter(route_id != "Shuttle") %>%
+	distinct()
+
+t_stops_withLines_buffered <- st_as_sf(t_stops_withLines, coords = c("stop_lon","stop_lat"),crs = 4326) %>%
+	sf::st_buffer(max_walk_meters_transport)
+t_stops_withLines_buffered
+```
+
+## Annotate CR stops with Lines, then create walking distance buffer around each stop
+
+```{r}
+cr_stops_withLines <- full_join(cr_stops,stop_route_lookup,by="stop_id") %>% 
+    dplyr::select(-stop_id,-trip_id,-shape_id) %>% 
+    as_tibble() %>% 
+    drop_na(route_id) %>%
+    drop_na(stop_lat) %>%
+    dplyr::filter(route_id != "Shuttle") %>% 
+    distinct()
+
+cr_stops_withLines_buffered <- st_as_sf(cr_stops_withLines, coords = c("stop_lon","stop_lat"),crs = 4326) %>%
+	sf::st_buffer(max_walk_meters_transport)
+cr_stops_withLines_buffered
+```
+
+## Annotate bus stops with Lines, then create walking distance buffer around each stop
+
+```{r}
+bus_stops_withLines <- full_join(bus_stops,stop_route_lookup,by="stop_id") %>% 
+    dplyr::select(-stop_id,-trip_id,-shape_id) %>% 
+    as_tibble() %>% 
+    drop_na(route_id) %>%
+    drop_na(stop_lat) %>%
+    distinct()
+
+bus_stops_withLines_buffered <- st_as_sf(bus_stops_withLines, coords = c("stop_lon","stop_lat"),crs = 4326) %>%
+	sf::st_buffer(max_walk_meters_transport)
+bus_stops_withLines_buffered
+```
+
+# Prepare census block information. We'll use this as a means of creating tiles around the greater Boston area
+
+## Import Massachusetts 2020 census blocks
+
+[Retrieved from here](https://www.mass.gov/info-details/massgis-data-2020-us-census)
+
+```{r}
+mass_censusblocks <- st_read(dsn = "~/Downloads/CENSUS2020_BLK_BG_TRCT/CENSUS2020BLOCKS_POLY.shp")
+```
+
+## Create a list of Greater Boston area towns
+
+```{r}
+greater_boston_towns <- c(
+	"Arlington",
+	"Belmont",
+	"Boston",
+	"Braintree",
+	"Brookline",
+	"Cambridge",
+	"Chelsea",
+	"Everett",
+	"Malden",
+	"Medford",
+	"Melrose",
+	"Milton",
+	"Newton",
+	"Quincy",
+	"Revere",
+	"Somerville",
+	"Waltham",
+	"Watertown",
+	"Winthrop"
+	)
+```
+
+## Filter census blocks for those in Greater Boston area towns
+
+```{r}
+greaterBoston_censusblocks <- mass_censusblocks[mass_censusblocks$TOWN %in% toupper(greater_boston_towns),]
+
+# A handful of these have invalid boundaries and will cause errors later, so let's repair them
+greaterBoston_censusblocks <- st_make_valid(greaterBoston_censusblocks)
+
+# Several blocks fall over water or other unpopulated areas, so let's remove those by asserting that population as of the 2020 census has to be non-zero
+greaterBoston_censusblocks <- greaterBoston_censusblocks[greaterBoston_censusblocks$POP20 > 0,]
+
+greaterBoston_censusblocks
+```
+
+# Intersect census blocks with MBTA transit data to find which blocks have walkable T, CR, and bus routes
+
+## Calculate which census blocks intersect buffered T, CR, and bus stops
+
+```{r}
+blocks_walkToT <- greaterBoston_censusblocks %>%
+	sf::st_transform(crs = 4326) %>%
+	sf::st_intersects(.,t_stops_withLines_buffered)
+blocks_walkToT
+
+blocks_walkToCR <- greaterBoston_censusblocks %>%
+	sf::st_transform(crs = 4326) %>%
+	sf::st_intersects(.,cr_stops_withLines_buffered)
+blocks_walkToCR
+
+blocks_walkToBus <- greaterBoston_censusblocks %>%
+	sf::st_transform(crs = 4326) %>%
+	sf::st_intersects(.,bus_stops_withLines_buffered)
+blocks_walkToBus
+```
+
+## Summarize number of unique T lines (by color) per census block
+
+Here we collapse all branches (-B, -C, -D, -E) of green, and call "Mattapan" as "Red" for simplicity
+
+Note this penalizes the Green line somewhat, given the distinct branches west of Kenmore. However given how slow the western branches of the Green line are, this score prioritizes having some truly rapid option and/or other mode of transit
+
+```{r}
+nLines_perBlock <- t_stops_withLines_buffered %>% 
+    as_tibble() %>% 
+    dplyr::select(-geometry) %>%
+    mutate(RowNumber = row_number()) %>%
+    mutate(route_id = str_replace_all(route_id,"-.","")) %>%
+    mutate(route_id = str_replace_all(route_id,"Mattapan","Red")) %>%
+    left_join(enframe(blocks_walkToT) %>% 
+    			unnest(cols=value,keep_empty = T),.,by=c("value" = "RowNumber")) %>% 
+    group_by(name) %>%
+    summarize(nLines = n_distinct(route_id,na.rm=T))
+nLines_perBlock
+
+# Add this annotation to our census blocks as a new column    
+greaterBoston_censusblocks$numTlines <- nLines_perBlock$nLines 
+```
+
+## Summarize number of unique CR lines per census block
+
+```{r}
+nCRLines_perBlock <- cr_stops_withLines_buffered %>% 
+    as_tibble() %>% 
+    dplyr::select(-geometry) %>%
+    mutate(RowNumber = row_number()) %>%
+    left_join(enframe(blocks_walkToCR) %>% 
+    			unnest(cols=value,keep_empty = T),.,by=c("value" = "RowNumber")) %>% 
+    group_by(name) %>%
+    summarize(nLines = n_distinct(route_id,na.rm=T))
+nCRLines_perBlock
+
+# Add this annotation to our census blocks as a new column       
+greaterBoston_censusblocks$numCRlines <- nCRLines_perBlock$nLines 
+```
+
+## Summarize number of unique bus lines per census block
+
+```{r}
+nBusLines_perBlock <- bus_stops_withLines_buffered %>% 
+    as_tibble() %>% 
+    dplyr::select(-geometry) %>%
+    mutate(RowNumber = row_number()) %>%
+    left_join(enframe(blocks_walkToBus) %>% 
+    			unnest(cols=value,keep_empty = T),.,by=c("value" = "RowNumber")) %>% 
+    group_by(name) %>%
+    summarize(nLines = n_distinct(route_id,na.rm=T))
+nBusLines_perBlock
+
+# Add this annotation to our census blocks as a new column       
+greaterBoston_censusblocks$numBuslines <- nBusLines_perBlock$nLines 
+```
+
+# Compute aggregated transit connectivity score per census block and plot our first map
+
+Scored as:
+
+-   0: no T, CR, or bus
+
+-   1: only one of T/CR/bus (ie relies only on one form of transit)
+
+-   2: T and either CR or bus present
+
+-   3: T, CR, bus all present
+
+```{r}
+T_connectivity <- cbind("numTlines" = greaterBoston_censusblocks$numTlines,
+		"numCRlines" = greaterBoston_censusblocks$numCRlines,
+		"numBuslines" = greaterBoston_censusblocks$numBuslines
+	) %>%
+	as_tibble() %>%
+	mutate(Connectivity = case_when(
+		(numTlines == 0) & (numCRlines == 0) & (numBuslines == 0) ~ 0,
+		(numTlines > 0) & (numCRlines > 0) & (numBuslines > 0) ~ 3,
+		(numTlines > 0) & ((numCRlines > 0) | (numBuslines > 0)) ~ 2,
+		(numCRlines > 0) & ((numTlines > 0) | (numBuslines > 0)) ~ 2,
+			((numTlines == 0) & (numCRlines == 0)) | 
+			((numTlines == 0) & (numBuslines == 0)) | 
+			((numCRlines == 0) & (numBuslines == 0)) ~ 1,
+		T ~ 999
+		)
+	)
+T_connectivity
+
+# Check that all scored as expected
+sum(T_connectivity$Connectivity==999)
+
+# Add Connectivity score to census block data matrix
+greaterBoston_censusblocks$T_connectivity <- T_connectivity$Connectivity
+```
+
+## Plot base map then color census blocks by T connectivity score
+
+```{r, eval=F}
+google_map(data=t_stops) %>% 
+	add_transit() %>%
+	add_polygons(data = st_transform(greaterBoston_censusblocks,crs = 4326), 
+		fill_colour = "T_connectivity",
+		fill_opacity = 0.75,
+		legend = T) 
+```
+
+![](Fig1.png)
+
+# Create a database of highly-rated points-of-interest that we factor in for good livability
+
+Here we include cafes, restaurants, parks/playgrounds, and grocery stores. I performed these queries more by neighborhood than town, since Google Maps retrieves results regardless for a fairly large area
+
+## Retrieve listings for highly-reviewed cafes in the greater Boston area
+
+Note the "coffee roaster" term is used here to try to avoid Dunkin', Starbucks, etc, but may miss some other good-quality cafes. Your priorities may vary.
+
+The `google_places` search can only retrieve 20 results at a time, so we grab a few pages worth for each neighborhood, then merge everything together, set a filter for star rating and a minimum number of reviews, and remove duplicates
+
+```{r,echo=F}
+cafes_merged <- readRDS("~/Desktop/GoogleMaps_Cafes_GreaterBoston_070824.rds")
+```
+
+```{r, eval=F}
+cafes_somerville <- google_places(search_string = "Coffee roaster in Somerville, MA",
+                     key = api)
+cafes_somerville_next1 <- google_places(search_string = "Coffee roaster in Somerville, MA",
+                          page_token = cafes_somerville$next_page_token,
+                          key = api)
+cafes_somerville_next2 <- google_places(search_string = "Coffee roaster in Somerville, MA",
+                          page_token = cafes_somerville_next1$next_page_token,
+                          key = api)
+cafes_cambridge <- google_places(search_string = "Coffee roaster in Cambridge, MA",
+                     key = api)
+cafes_cambridge_next1 <- google_places(search_string = "Coffee roaster in Cambridge, MA",
+                          page_token = cafes_cambridge$next_page_token,
+                          key = api)
+cafes_cambridge_next2 <- google_places(search_string = "Coffee roaster in Cambridge, MA",
+                          page_token = cafes_cambridge_next1$next_page_token,
+                          key = api)
+cafes_boston <- google_places(search_string = "Coffee roaster in Boston, MA",
+                     key = api)
+cafes_boston_next1 <- google_places(search_string = "Coffee roaster in Boston, MA",
+                          page_token = cafes_boston$next_page_token,
+                          key = api)
+cafes_boston_next2 <- google_places(search_string = "Coffee roaster in Boston, MA",
+                          page_token = cafes_boston_next1$next_page_token,
+                          key = api)
+cafes_brookline <- google_places(search_string = "Coffee roaster in Brookline, MA",
+                     key = api)
+cafes_brookline_next1 <- google_places(search_string = "Coffee roaster in Brookline, MA",
+                          page_token = cafes_brookline$next_page_token,
+                          key = api)
+cafes_brookline_next2 <- google_places(search_string = "Coffee roaster in Brookline, MA",
+                          page_token = cafes_brookline_next1$next_page_token,
+                          key = api)
+cafes_jp <- google_places(search_string = "Coffee roaster in Jamaica Plain, MA",
+                     key = api)
+cafes_jp_next1 <- google_places(search_string = "Coffee roaster in Jamaica Plain, MA",
+                          page_token = cafes_jp$next_page_token,
+                          key = api)
+cafes_jp_next2 <- google_places(search_string = "Coffee roaster in Jamaica Plain, MA",
+                          page_token = cafes_jp_next1$next_page_token,
+                          key = api)
+cafes_medford <- google_places(search_string = "Coffee roaster in Medford, MA",
+                     key = api)
+cafes_medford_next1 <- google_places(search_string = "Coffee roaster in Medford, MA",
+                          page_token = cafes_medford$next_page_token,
+                          key = api)
+cafes_medford_next2 <- google_places(search_string = "Coffee roaster in Medford, MA",
+                          page_token = cafes_medford_next1$next_page_token,
+                          key = api)
+cafes_belmont <- google_places(search_string = "Coffee roaster in Belmont, MA",
+                     key = api)
+cafes_belmont_next1 <- google_places(search_string = "Coffee roaster in Belmont, MA",
+                          page_token = cafes_belmont$next_page_token,
+                          key = api)
+cafes_belmont_next2 <- google_places(search_string = "Coffee roaster in Belmont, MA",
+                          page_token = cafes_belmont_next1$next_page_token,
+                          key = api)
+cafes_dorchester <- google_places(search_string = "Coffee roaster in Dorchester, MA",
+                     key = api)
+cafes_dorchester_next1 <- google_places(search_string = "Coffee roaster in Dorchester, MA",
+                          page_token = cafes_dorchester$next_page_token,
+                          key = api)
+cafes_dorchester_next2 <- google_places(search_string = "Coffee roaster in Dorchester, MA",
+                          page_token = cafes_dorchester_next1$next_page_token,
+                          key = api)
+cafes_charles <- google_places(search_string = "Coffee roaster in Charlestown, MA",
+                     key = api)
+cafes_charles_next1 <- google_places(search_string = "Coffee roaster in Charlestown, MA",
+                          page_token = cafes_charles$next_page_token,
+                          key = api)
+cafes_charles_next2 <- google_places(search_string = "Coffee roaster in Charlestown, MA",
+                          page_token = cafes_charles_next1$next_page_token,
+                          key = api)
+cafes_brighton <- google_places(search_string = "Coffee roaster in Brighton, MA",
+                     key = api)
+cafes_brighton_next1 <- google_places(search_string = "Coffee roaster in Brighton, MA",
+                          page_token = cafes_brighton$next_page_token,
+                          key = api)
+cafes_brighton_next2 <- google_places(search_string = "Coffee roaster in Brighton, MA",
+                          page_token = cafes_brighton_next1$next_page_token,
+                          key = api)
+cafes_newton <- google_places(search_string = "Coffee roaster in Newton, MA",
+                     key = api)
+cafes_newton_next1 <- google_places(search_string = "Coffee roaster in Newton, MA",
+                          page_token = cafes_newton$next_page_token,
+                          key = api)
+cafes_newton_next2 <- google_places(search_string = "Coffee roaster in Newton, MA",
+                          page_token = cafes_newton_next1$next_page_token,
+                          key = api)
+                     
+
+cafes_merged <- cafes_somerville$results %>% 
+	as_tibble() %>% 
+	bind_rows(cafes_cambridge$results) %>%
+	bind_rows(cafes_boston$results) %>%
+	bind_rows(cafes_brookline$results) %>%
+	bind_rows(cafes_jp$results) %>%
+	bind_rows(cafes_medford$results) %>%
+	bind_rows(cafes_belmont$results) %>%
+	bind_rows(cafes_dorchester$results) %>%	
+	bind_rows(cafes_charles$results) %>%
+	bind_rows(cafes_brighton$results) %>%
+	bind_rows(cafes_newton$results) %>%
+	bind_rows(cafes_somerville_next1$results) %>%
+	bind_rows(cafes_somerville_next2$results) %>%
+	bind_rows(cafes_cambridge_next1$results) %>%
+	bind_rows(cafes_cambridge_next2$results) %>%
+	bind_rows(cafes_boston_next1$results) %>%
+	bind_rows(cafes_boston_next2$results) %>%
+	bind_rows(cafes_brookline_next1$results) %>%
+	bind_rows(cafes_brookline_next2$results) %>%
+	bind_rows(cafes_jp_next1$results) %>%
+	bind_rows(cafes_jp_next2$results) %>%
+	bind_rows(cafes_medford_next1$results) %>%
+	bind_rows(cafes_medford_next2$results) %>%
+	bind_rows(cafes_belmont_next1$results) %>%
+	bind_rows(cafes_belmont_next2$results) %>%
+	bind_rows(cafes_dorchester_next1$results) %>%
+	bind_rows(cafes_dorchester_next2$results) %>%
+	bind_rows(cafes_charles_next1$results) %>%
+	bind_rows(cafes_charles_next2$results) %>%
+	bind_rows(cafes_brighton_next1$results) %>%
+	bind_rows(cafes_brighton_next2$results) %>%
+	bind_rows(cafes_newton_next1$results) %>%
+	bind_rows(cafes_newton_next2$results) %>%
+	unnest(cols = geometry) %>% 
+	unnest(location) %>% 
+	dplyr::select(name,lat,lng,rating,user_ratings_total) %>%
+	dplyr::filter(rating > 4.25 & user_ratings_total > 10) %>%
+	dplyr::distinct(name, lat, lng, .keep_all=TRUE)
+
+```
+
+### Peek at result, then buffer by max walking distance
+
+```{r}
+cafes_merged
+
+cafes_merged_buffered <- st_as_sf(cafes_merged, coords = c("lng","lat"),crs = 4326) %>%
+	sf::st_buffer(max_walk_meters)
+```
+
+### Find which census blocks have a cafe in walking distance
+
+```{r}
+blocks_walkToCafe <- greaterBoston_censusblocks %>%
+	sf::st_transform(crs = 4326) %>%
+	sf::st_intersects(.,cafes_merged_buffered)
+```
+
+### Summarize number of cafes found within walking distance per block, and create a binned score based on these counts
+
+```{r}
+nCafes_perBlock <- lengths(blocks_walkToCafe) %>%
+	as_tibble() %>%
+	mutate(nCafe = case_when(
+		value == 0 ~ 0,
+		(value > 0) & (value < 3) ~ 1,
+		value >= 3 ~ 2		
+		)
+	)
+    
+greaterBoston_censusblocks$nCafes <- nCafes_perBlock$nCafe
+```
+
+### Plot base map then color census blocks by cafe score
+
+```{r,eval=F}
+google_map(data=t_stops) %>% 
+	add_transit() %>%
+	add_polygons(data = st_transform(greaterBoston_censusblocks,crs = 4326), 
+		fill_colour = "nCafes",
+		fill_opacity = 0.75,
+		legend = T) 
+```
+
+![](Fig2.png)
+
+## Retrieve listings for highly-reviewed restaurants in the greater Boston area
+
+```{r,echo=F}
+restaurants_merged <- readRDS("~/Desktop/GoogleMaps_Restaurants_GreaterBoston_070824.rds")
+```
+
+```{r, eval=F}
+restaurants_somerville <- google_places(search_string = "Restaurant in Somerville, MA",
+                     key = api)
+restaurants_somerville_next1 <- google_places(search_string = "Restaurant in Somerville, MA",
+                          page_token = restaurants_somerville$next_page_token,
+                          key = api)
+restaurants_somerville_next2 <- google_places(search_string = "Restaurant in Somerville, MA",
+                          page_token = restaurants_somerville_next1$next_page_token,
+                          key = api)
+restaurants_cambridge <- google_places(search_string = "Restaurant in Cambridge, MA",
+                     key = api)
+restaurants_cambridge_next1 <- google_places(search_string = "Restaurant in Cambridge, MA",
+                          page_token = restaurants_cambridge$next_page_token,
+                          key = api)
+restaurants_cambridge_next2 <- google_places(search_string = "Restaurant in Cambridge, MA",
+                          page_token = restaurants_cambridge_next1$next_page_token,
+                          key = api)
+restaurants_boston <- google_places(search_string = "Restaurant in Boston, MA",
+                     key = api)
+restaurants_boston_next1 <- google_places(search_string = "Restaurant in Boston, MA",
+                          page_token = restaurants_boston$next_page_token,
+                          key = api)
+restaurants_boston_next2 <- google_places(search_string = "Restaurant in Boston, MA",
+                          page_token = restaurants_boston_next1$next_page_token,
+                          key = api)
+restaurants_brookline <- google_places(search_string = "Restaurant in Brookline, MA",
+                     key = api)
+restaurants_brookline_next1 <- google_places(search_string = "Restaurant in Brookline, MA",
+                          page_token = restaurants_brookline$next_page_token,
+                          key = api)
+restaurants_brookline_next2 <- google_places(search_string = "Restaurant in Brookline, MA",
+                          page_token = restaurants_brookline_next1$next_page_token,
+                          key = api)
+restaurants_jp <- google_places(search_string = "Restaurant in Jamaica Plain, MA",
+                     key = api)
+restaurants_jp_next1 <- google_places(search_string = "Restaurant in Jamaica Plain, MA",
+                          page_token = restaurants_jp$next_page_token,
+                          key = api)
+restaurants_jp_next2 <- google_places(search_string = "Restaurant in Jamaica Plain, MA",
+                          page_token = restaurants_jp_next1$next_page_token,
+                          key = api)
+restaurants_medford <- google_places(search_string = "Restaurant in Medford, MA",
+                     key = api)
+restaurants_medford_next1 <- google_places(search_string = "Restaurant in Medford, MA",
+                          page_token = restaurants_medford$next_page_token,
+                          key = api)
+restaurants_medford_next2 <- google_places(search_string = "Restaurant in Medford, MA",
+                          page_token = restaurants_medford_next1$next_page_token,
+                          key = api)
+restaurants_belmont <- google_places(search_string = "Restaurant in Belmont, MA",
+                     key = api)
+restaurants_belmont_next1 <- google_places(search_string = "Restaurant in Belmont, MA",
+                          page_token = restaurants_belmont$next_page_token,
+                          key = api)
+restaurants_belmont_next2 <- google_places(search_string = "Restaurant in Belmont, MA",
+                          page_token = restaurants_belmont_next1$next_page_token,
+                          key = api)
+restaurants_dorchester <- google_places(search_string = "Restaurant in Dorchester, MA",
+                     key = api)
+restaurants_dorchester_next1 <- google_places(search_string = "Restaurant in Dorchester, MA",
+                          page_token = restaurants_dorchester$next_page_token,
+                          key = api)
+restaurants_dorchester_next2 <- google_places(search_string = "Restaurant in Dorchester, MA",
+                          page_token = restaurants_dorchester_next1$next_page_token,
+                          key = api)
+restaurants_charles <- google_places(search_string = "Restaurant in Charlestown, MA",
+                     key = api)
+restaurants_charles_next1 <- google_places(search_string = "Restaurant in Charlestown, MA",
+                          page_token = restaurants_charles$next_page_token,
+                          key = api)
+restaurants_charles_next2 <- google_places(search_string = "Restaurant in Charlestown, MA",
+                          page_token = restaurants_charles_next1$next_page_token,
+                          key = api)
+restaurants_brighton <- google_places(search_string = "Restaurant in Brighton, MA",
+                     key = api)
+restaurants_brighton_next1 <- google_places(search_string = "Restaurant in Brighton, MA",
+                          page_token = restaurants_brighton$next_page_token,
+                          key = api)
+restaurants_brighton_next2 <- google_places(search_string = "Restaurant in Brighton, MA",
+                          page_token = restaurants_brighton_next1$next_page_token,
+                          key = api)
+restaurants_newton <- google_places(search_string = "Restaurant in Newton, MA",
+                     key = api)
+restaurants_newton_next1 <- google_places(search_string = "Restaurant in Newton, MA",
+                          page_token = restaurants_newton$next_page_token,
+                          key = api)
+restaurants_newton_next2 <- google_places(search_string = "Restaurant in Newton, MA",
+                          page_token = restaurants_newton_next1$next_page_token,
+                          key = api)
+                     
+
+restaurants_merged <- restaurants_somerville$results %>% 
+	as_tibble() %>% 
+	bind_rows(restaurants_cambridge$results) %>%
+	bind_rows(restaurants_boston$results) %>%
+	bind_rows(restaurants_brookline$results) %>%
+	bind_rows(restaurants_jp$results) %>%
+	bind_rows(restaurants_medford$results) %>%
+	bind_rows(restaurants_belmont$results) %>%
+	bind_rows(restaurants_dorchester$results) %>%	
+	bind_rows(restaurants_charles$results) %>%
+	bind_rows(restaurants_brighton$results) %>%
+	bind_rows(restaurants_newton$results) %>%
+	bind_rows(restaurants_somerville_next1$results) %>%
+	bind_rows(restaurants_somerville_next2$results) %>%
+	bind_rows(restaurants_cambridge_next1$results) %>%
+	bind_rows(restaurants_cambridge_next2$results) %>%
+	bind_rows(restaurants_boston_next1$results) %>%
+	bind_rows(restaurants_boston_next2$results) %>%
+	bind_rows(restaurants_brookline_next1$results) %>%
+	bind_rows(restaurants_brookline_next2$results) %>%
+	bind_rows(restaurants_jp_next1$results) %>%
+	bind_rows(restaurants_jp_next2$results) %>%
+	bind_rows(restaurants_medford_next1$results) %>%
+	bind_rows(restaurants_medford_next2$results) %>%
+	bind_rows(restaurants_belmont_next1$results) %>%
+	bind_rows(restaurants_belmont_next2$results) %>%
+	bind_rows(restaurants_dorchester_next1$results) %>%
+	bind_rows(restaurants_dorchester_next2$results) %>%
+	bind_rows(restaurants_charles_next1$results) %>%
+	bind_rows(restaurants_charles_next2$results) %>%
+	bind_rows(restaurants_brighton_next1$results) %>%
+	bind_rows(restaurants_brighton_next2$results) %>%
+	bind_rows(restaurants_newton_next1$results) %>%
+	bind_rows(restaurants_newton_next2$results) %>%
+	unnest(cols = geometry) %>% 
+	unnest(location) %>% 
+	dplyr::select(name,lat,lng,rating,user_ratings_total) %>%
+	dplyr::filter(rating > 4 & user_ratings_total > 10) %>%
+	dplyr::distinct(name, lat, lng, .keep_all=TRUE)
+
+```
+
+### Peek at result, then buffer by max walking distance
+
+```{r}
+restaurants_merged
+
+restaurants_merged_buffered <- st_as_sf(restaurants_merged, coords = c("lng","lat"),crs = 4326) %>%
+	sf::st_buffer(max_walk_meters)
+```
+
+### Find which census blocks have a restaurant in walking distance
+
+```{r}
+blocks_walkToRestaurant <- greaterBoston_censusblocks %>%
+	sf::st_transform(crs = 4326) %>%
+	sf::st_intersects(.,restaurants_merged_buffered)
+```
+
+### Summarize number of restaurants found within walking distance per block, and create score
+
+```{r}
+nRestaurants_perBlock <- lengths(blocks_walkToRestaurant) %>%
+	as_tibble() %>%
+	mutate(nRestaurants = case_when(
+		value == 0 ~ 0,
+		(value > 0) & (value < 3) ~ 1,
+		value >= 3 ~ 2		
+		)
+	)
+    
+greaterBoston_censusblocks$nRestaurants <- nRestaurants_perBlock$nRestaurants
+```
+
+### Plot base map then color census blocks by restaurant score
+
+```{r,eval=F}
+google_map(data=t_stops) %>% 
+	add_transit() %>%
+	add_polygons(data = st_transform(greaterBoston_censusblocks,crs = 4326), 
+		fill_colour = "nRestaurants",
+		fill_opacity = 0.75,
+		legend = T) 
+```
+
+![](Fig3.png)
+
+## Retrieve listings for highly-reviewed grocery stores in the greater Boston area
+
+```{r,echo=F}
+grocery_merged <- readRDS("~/Desktop/GoogleMaps_Grocery_GreaterBoston_070824.rds")
+```
+
+```{r, eval=F}
+grocery_somerville <- google_places(search_string = "Grocery store in Somerville, MA",
+                     key = api)
+grocery_somerville_next1 <- google_places(search_string = "Grocery store in Somerville, MA",
+                          page_token = grocery_somerville$next_page_token,
+                          key = api)
+grocery_somerville_next2 <- google_places(search_string = "Grocery store in Somerville, MA",
+                          page_token = grocery_somerville_next1$next_page_token,
+                          key = api)
+grocery_cambridge <- google_places(search_string = "Grocery store in Cambridge, MA",
+                     key = api)
+grocery_cambridge_next1 <- google_places(search_string = "Grocery store in Cambridge, MA",
+                          page_token = grocery_cambridge$next_page_token,
+                          key = api)
+grocery_cambridge_next2 <- google_places(search_string = "Grocery store in Cambridge, MA",
+                          page_token = grocery_cambridge_next1$next_page_token,
+                          key = api)
+grocery_boston <- google_places(search_string = "Grocery store in Boston, MA",
+                     key = api)
+grocery_boston_next1 <- google_places(search_string = "Grocery store in Boston, MA",
+                          page_token = grocery_boston$next_page_token,
+                          key = api)
+grocery_boston_next2 <- google_places(search_string = "Grocery store in Boston, MA",
+                          page_token = grocery_boston_next1$next_page_token,
+                          key = api)
+grocery_brookline <- google_places(search_string = "Grocery store in Brookline, MA",
+                     key = api)
+grocery_brookline_next1 <- google_places(search_string = "Grocery store in Brookline, MA",
+                          page_token = grocery_brookline$next_page_token,
+                          key = api)
+grocery_brookline_next2 <- google_places(search_string = "Grocery store in Brookline, MA",
+                          page_token = grocery_brookline_next1$next_page_token,
+                          key = api)
+grocery_jp <- google_places(search_string = "Grocery store in Jamaica Plain, MA",
+                     key = api)
+grocery_jp_next1 <- google_places(search_string = "Grocery store in Jamaica Plain, MA",
+                          page_token = grocery_jp$next_page_token,
+                          key = api)
+grocery_jp_next2 <- google_places(search_string = "Grocery store in Jamaica Plain, MA",
+                          page_token = grocery_jp_next1$next_page_token,
+                          key = api)
+grocery_medford <- google_places(search_string = "Grocery store in Medford, MA",
+                     key = api)
+grocery_medford_next1 <- google_places(search_string = "Grocery store in Medford, MA",
+                          page_token = grocery_medford$next_page_token,
+                          key = api)
+grocery_medford_next2 <- google_places(search_string = "Grocery store in Medford, MA",
+                          page_token = grocery_medford_next1$next_page_token,
+                          key = api)
+grocery_belmont <- google_places(search_string = "Grocery store in Belmont, MA",
+                     key = api)
+grocery_belmont_next1 <- google_places(search_string = "Grocery store in Belmont, MA",
+                          page_token = grocery_belmont$next_page_token,
+                          key = api)
+grocery_belmont_next2 <- google_places(search_string = "Grocery store in Belmont, MA",
+                          page_token = grocery_belmont_next1$next_page_token,
+                          key = api)
+grocery_dorchester <- google_places(search_string = "Grocery store in Dorchester, MA",
+                     key = api)
+grocery_dorchester_next1 <- google_places(search_string = "Grocery store in Dorchester, MA",
+                          page_token = grocery_dorchester$next_page_token,
+                          key = api)
+grocery_dorchester_next2 <- google_places(search_string = "Grocery store in Dorchester, MA",
+                          page_token = grocery_dorchester_next1$next_page_token,
+                          key = api)
+grocery_charles <- google_places(search_string = "Grocery store in Charlestown, MA",
+                     key = api)
+grocery_charles_next1 <- google_places(search_string = "Grocery store in Charlestown, MA",
+                          page_token = grocery_charles$next_page_token,
+                          key = api)
+grocery_charles_next2 <- google_places(search_string = "Grocery store in Charlestown, MA",
+                          page_token = grocery_charles_next1$next_page_token,
+                          key = api)
+grocery_brighton <- google_places(search_string = "Grocery store in Brighton, MA",
+                     key = api)
+grocery_brighton_next1 <- google_places(search_string = "Grocery store in Brighton, MA",
+                          page_token = grocery_brighton$next_page_token,
+                          key = api)
+grocery_brighton_next2 <- google_places(search_string = "Grocery store in Brighton, MA",
+                          page_token = grocery_brighton_next1$next_page_token,
+                          key = api)
+grocery_newton <- google_places(search_string = "Grocery store in Newton, MA",
+                     key = api)
+grocery_newton_next1 <- google_places(search_string = "Grocery store in Newton, MA",
+                          page_token = grocery_newton$next_page_token,
+                          key = api)
+grocery_newton_next2 <- google_places(search_string = "Grocery store in Newton, MA",
+                          page_token = grocery_newton_next1$next_page_token,
+                          key = api)
+                     
+
+grocery_merged <- grocery_somerville$results %>% 
+	as_tibble() %>% 
+	bind_rows(grocery_cambridge$results) %>%
+	bind_rows(grocery_boston$results) %>%
+	bind_rows(grocery_brookline$results) %>%
+	bind_rows(grocery_jp$results) %>%
+	bind_rows(grocery_medford$results) %>%
+	bind_rows(grocery_belmont$results) %>%
+	bind_rows(grocery_dorchester$results) %>%	
+	bind_rows(grocery_charles$results) %>%
+	bind_rows(grocery_brighton$results) %>%
+	bind_rows(grocery_newton$results) %>%
+	bind_rows(grocery_somerville_next1$results) %>%
+	bind_rows(grocery_somerville_next2$results) %>%
+	bind_rows(grocery_cambridge_next1$results) %>%
+	bind_rows(grocery_cambridge_next2$results) %>%
+	bind_rows(grocery_boston_next1$results) %>%
+	bind_rows(grocery_boston_next2$results) %>%
+	bind_rows(grocery_brookline_next1$results) %>%
+	bind_rows(grocery_brookline_next2$results) %>%
+	bind_rows(grocery_jp_next1$results) %>%
+	bind_rows(grocery_jp_next2$results) %>%
+	bind_rows(grocery_medford_next1$results) %>%
+	bind_rows(grocery_medford_next2$results) %>%
+	bind_rows(grocery_belmont_next1$results) %>%
+	bind_rows(grocery_belmont_next2$results) %>%
+	bind_rows(grocery_dorchester_next1$results) %>%
+	bind_rows(grocery_dorchester_next2$results) %>%
+	bind_rows(grocery_charles_next1$results) %>%
+	bind_rows(grocery_charles_next2$results) %>%
+	bind_rows(grocery_brighton_next1$results) %>%
+	bind_rows(grocery_brighton_next2$results) %>%
+	bind_rows(grocery_newton_next1$results) %>%
+	bind_rows(grocery_newton_next2$results) %>%
+	unnest(cols = geometry) %>% 
+	unnest(location) %>% 
+	dplyr::select(name,lat,lng,rating,user_ratings_total) %>%
+	dplyr::filter(rating > 4 & user_ratings_total > 10) %>%
+	dplyr::distinct(name, lat, lng, .keep_all=TRUE)
+
+```
+
+### Peek at result, then buffer by max walking distance
+
+```{r}
+grocery_merged
+
+grocery_merged_buffered <- st_as_sf(grocery_merged, coords = c("lng","lat"),crs = 4326) %>%
+	sf::st_buffer(max_walk_meters)
+```
+
+### Find which census blocks have a grocery store in walking distance
+
+```{r}
+blocks_walkToGrocery <- greaterBoston_censusblocks %>%
+	sf::st_transform(crs = 4326) %>%
+	sf::st_intersects(.,grocery_merged_buffered)
+```
+
+### Summarize number of grocery stores found within walking distance per block, and create score
+
+```{r}
+nGrocery_perBlock <- lengths(blocks_walkToGrocery) %>%
+	as_tibble() %>%
+	mutate(nGrocery = case_when(
+		value == 0 ~ 0,
+		(value > 0) & (value < 3) ~ 1,
+		value >= 3 ~ 2		
+		)
+	)
+    
+greaterBoston_censusblocks$nGrocery <- nGrocery_perBlock$nGrocery
+```
+
+### Plot base map then color census blocks by Grocery score
+
+```{r,eval=F}
+google_map(data=t_stops) %>% 
+	add_transit() %>%
+	add_polygons(data = st_transform(greaterBoston_censusblocks,crs = 4326), 
+		fill_colour = "nGrocery",
+		fill_opacity = 0.75,
+		legend = T) 
+```
+
+![](Fig4.png)
+
+## Retrieve listings for highly-reviewed parks and playgrounds in the greater Boston area
+
+```{r,echo=F}
+parks_merged <- readRDS("~/Desktop/GoogleMaps_Parks_GreaterBoston_070824.rds")
+```
+
+```{r, eval=F}
+parks_somerville <- google_places(search_string = "Parks and playgrounds in Somerville, MA",
+                     key = api)
+parks_somerville_next1 <- google_places(search_string = "Parks and playgrounds in Somerville, MA",
+                          page_token = parks_somerville$next_page_token,
+                          key = api)
+parks_somerville_next2 <- google_places(search_string = "Parks and playgrounds in Somerville, MA",
+                          page_token = parks_somerville_next1$next_page_token,
+                          key = api)
+parks_cambridge <- google_places(search_string = "Parks and playgrounds in Cambridge, MA",
+                     key = api)
+parks_cambridge_next1 <- google_places(search_string = "Parks and playgrounds in Cambridge, MA",
+                          page_token = parks_cambridge$next_page_token,
+                          key = api)
+parks_cambridge_next2 <- google_places(search_string = "Parks and playgrounds in Cambridge, MA",
+                          page_token = parks_cambridge_next1$next_page_token,
+                          key = api)
+parks_boston <- google_places(search_string = "Parks and playgrounds in Boston, MA",
+                     key = api)
+parks_boston_next1 <- google_places(search_string = "Parks and playgrounds in Boston, MA",
+                          page_token = parks_boston$next_page_token,
+                          key = api)
+parks_boston_next2 <- google_places(search_string = "Parks and playgrounds in Boston, MA",
+                          page_token = parks_boston_next1$next_page_token,
+                          key = api)
+parks_brookline <- google_places(search_string = "Parks and playgrounds in Brookline, MA",
+                     key = api)
+parks_brookline_next1 <- google_places(search_string = "Parks and playgrounds in Brookline, MA",
+                          page_token = parks_brookline$next_page_token,
+                          key = api)
+parks_brookline_next2 <- google_places(search_string = "Parks and playgrounds in Brookline, MA",
+                          page_token = parks_brookline_next1$next_page_token,
+                          key = api)
+parks_jp <- google_places(search_string = "Parks and playgrounds in Jamaica Plain, MA",
+                     key = api)
+parks_jp_next1 <- google_places(search_string = "Parks and playgrounds in Jamaica Plain, MA",
+                          page_token = parks_jp$next_page_token,
+                          key = api)
+parks_jp_next2 <- google_places(search_string = "Parks and playgrounds in Jamaica Plain, MA",
+                          page_token = parks_jp_next1$next_page_token,
+                          key = api)
+parks_medford <- google_places(search_string = "Parks and playgrounds in Medford, MA",
+                     key = api)
+parks_medford_next1 <- google_places(search_string = "Parks and playgrounds in Medford, MA",
+                          page_token = parks_medford$next_page_token,
+                          key = api)
+parks_medford_next2 <- google_places(search_string = "Parks and playgrounds in Medford, MA",
+                          page_token = parks_medford_next1$next_page_token,
+                          key = api)
+parks_belmont <- google_places(search_string = "Parks and playgrounds in Belmont, MA",
+                     key = api)
+parks_belmont_next1 <- google_places(search_string = "Parks and playgrounds in Belmont, MA",
+                          page_token = parks_belmont$next_page_token,
+                          key = api)
+parks_belmont_next2 <- google_places(search_string = "Parks and playgrounds in Belmont, MA",
+                          page_token = parks_belmont_next1$next_page_token,
+                          key = api)
+parks_dorchester <- google_places(search_string = "Parks and playgrounds in Dorchester, MA",
+                     key = api)
+parks_dorchester_next1 <- google_places(search_string = "Parks and playgrounds in Dorchester, MA",
+                          page_token = parks_dorchester$next_page_token,
+                          key = api)
+parks_dorchester_next2 <- google_places(search_string = "Parks and playgrounds in Dorchester, MA",
+                          page_token = parks_dorchester_next1$next_page_token,
+                          key = api)
+parks_charles <- google_places(search_string = "Parks and playgrounds in Charlestown, MA",
+                     key = api)
+parks_charles_next1 <- google_places(search_string = "Parks and playgrounds in Charlestown, MA",
+                          page_token = parks_charles$next_page_token,
+                          key = api)
+parks_charles_next2 <- google_places(search_string = "Parks and playgrounds in Charlestown, MA",
+                          page_token = parks_charles_next1$next_page_token,
+                          key = api)
+parks_brighton <- google_places(search_string = "Parks and playgrounds in Brighton, MA",
+                     key = api)
+parks_brighton_next1 <- google_places(search_string = "Parks and playgrounds in Brighton, MA",
+                          page_token = parks_brighton$next_page_token,
+                          key = api)
+parks_brighton_next2 <- google_places(search_string = "Parks and playgrounds in Brighton, MA",
+                          page_token = parks_brighton_next1$next_page_token,
+                          key = api)
+parks_newton <- google_places(search_string = "Parks and playgrounds in Newton, MA",
+                     key = api)
+parks_newton_next1 <- google_places(search_string = "Parks and playgrounds in Newton, MA",
+                          page_token = parks_newton$next_page_token,
+                          key = api)
+parks_newton_next2 <- google_places(search_string = "Parks and playgrounds in Newton, MA",
+                          page_token = parks_newton_next1$next_page_token,
+                          key = api)
+                     
+
+parks_merged <- parks_somerville$results %>% 
+	as_tibble() %>% 
+	bind_rows(parks_cambridge$results) %>%
+	bind_rows(parks_boston$results) %>%
+	bind_rows(parks_brookline$results) %>%
+	bind_rows(parks_jp$results) %>%
+	bind_rows(parks_medford$results) %>%
+	bind_rows(parks_belmont$results) %>%
+	bind_rows(parks_dorchester$results) %>%	
+	bind_rows(parks_charles$results) %>%
+	bind_rows(parks_brighton$results) %>%
+	bind_rows(parks_newton$results) %>%
+	bind_rows(parks_somerville_next1$results) %>%
+	bind_rows(parks_somerville_next2$results) %>%
+	bind_rows(parks_cambridge_next1$results) %>%
+	bind_rows(parks_cambridge_next2$results) %>%
+	bind_rows(parks_boston_next1$results) %>%
+	bind_rows(parks_boston_next2$results) %>%
+	bind_rows(parks_brookline_next1$results) %>%
+	bind_rows(parks_brookline_next2$results) %>%
+	bind_rows(parks_jp_next1$results) %>%
+	bind_rows(parks_jp_next2$results) %>%
+	bind_rows(parks_medford_next1$results) %>%
+	bind_rows(parks_medford_next2$results) %>%
+	bind_rows(parks_belmont_next1$results) %>%
+	bind_rows(parks_belmont_next2$results) %>%
+	bind_rows(parks_dorchester_next1$results) %>%
+	bind_rows(parks_dorchester_next2$results) %>%
+	bind_rows(parks_charles_next1$results) %>%
+	bind_rows(parks_charles_next2$results) %>%
+	bind_rows(parks_brighton_next1$results) %>%
+	bind_rows(parks_brighton_next2$results) %>%
+	bind_rows(parks_newton_next1$results) %>%
+	bind_rows(parks_newton_next2$results) %>%
+	unnest(cols = geometry) %>% 
+	unnest(location) %>% 
+	dplyr::select(name,lat,lng,rating,user_ratings_total) %>%
+	dplyr::filter(rating > 4 & user_ratings_total > 10) %>%
+	dplyr::distinct(name, lat, lng, .keep_all=TRUE)
+
+```
+
+### Peek at result, then buffer by max walking distance
+
+```{r}
+parks_merged
+
+parks_merged_buffered <- st_as_sf(parks_merged, coords = c("lng","lat"),crs = 4326) %>%
+	sf::st_buffer(max_walk_meters)
+```
+
+### Find which census blocks have a park or playground in walking distance
+
+```{r}
+blocks_walkToParks <- greaterBoston_censusblocks %>%
+	sf::st_transform(crs = 4326) %>%
+	sf::st_intersects(.,parks_merged_buffered)
+```
+
+### Summarize number of parks or playgrounds found within walking distance per block, and create score
+
+```{r}
+nParks_perBlock <- lengths(blocks_walkToParks) %>%
+	as_tibble() %>%
+	mutate(nParks = case_when(
+		value == 0 ~ 0,
+		(value > 0) & (value < 3) ~ 1,
+		value >= 3 ~ 2		
+		)
+	)
+    
+greaterBoston_censusblocks$nParks <- nParks_perBlock$nParks
+```
+
+### Plot base map then color census blocks by parks score
+
+```{r,eval=F}
+google_map(data=t_stops) %>% 
+	add_transit() %>%
+	add_polygons(data = st_transform(greaterBoston_censusblocks,crs = 4326), 
+		fill_colour = "nParks",
+		fill_opacity = 0.75,
+		legend = T) 
+
+```
+
+![](Fig5.png)
+
+# Compute overall walkability score
+
+This is the sum of the T connectivity score above, as well as the density scores we calculated for cafes, restaurants, groceries, and parks within reasonable walking distance. This intentionally weights the T-connectivity score slightly, since accessibility via public transport is important to us.
+
+```{r}
+walkabilityScore <- cbind("T_connectivity" = greaterBoston_censusblocks$T_connectivity,
+							"nCafes" = greaterBoston_censusblocks$nCafes,
+							"nRestaurants" = greaterBoston_censusblocks$nRestaurants,
+							"nGrocery" = greaterBoston_censusblocks$nGrocery,
+							"nParks" = greaterBoston_censusblocks$nParks
+	) %>%
+	as_tibble() %>%
+	rowwise() %>%
+	mutate(walkability = sum(T_connectivity,nCafes,nRestaurants,nGrocery,nParks))
+
+walkabilityScore
+
+greaterBoston_censusblocks$walkabilityScore <- walkabilityScore$walkability
+```
+
+## Plot base map then color census blocks by walkability score
+
+```{r,eval=F}
+google_map(data=t_stops) %>% 
+	add_transit() %>%
+	add_polygons(data = st_transform(greaterBoston_censusblocks,crs = 4326), 
+		fill_colour = "walkabilityScore",
+		fill_opacity = 0.75,
+		legend = T) 
+
+```
+
+![](Fig6.png)
+
+# Compute commute time from the centroid of filtered census blocks to each of our workplaces in the Longwood Medical Area and MGH
+
+## Set destination locations and example departure time
+
+```{r}
+work1 <- "3 Blackfan Street, Boston, MA"
+work2 <- "55 Fruit St, Boston, MA"
+
+monday_morning <- as.POSIXct("2024-07-08 09:00:00", tz = "America/New_York")
+```
+
+## Compute centroid of each census block
+
+Optionally, first filter our census blocks by various criteria to cut down on number of API calls. Doing this many times can create a large bill, so plan and filter accordingly. Here I require a minimum walkability score of 9 to proceed
+
+```{r}
+census_centroids <- greaterBoston_censusblocks[greaterBoston_censusblocks$walkabilityScore>=9,] %>%
+	sf::st_transform(crs = 4326) %>%
+	sf::st_centroid() %>% 
+	sf::st_coordinates()
+```
+
+## Compute these in chunks of 25 or fewer, splitting into 200 bins makes the max group size \<25 here
+
+```{r,eval=F}
+census_centroids_chunks <- as.data.frame(census_centroids) %>%
+	as_tibble() %>%
+	mutate(Chunk = ntile(n=200)) %>%
+	dplyr::select(Y,X,Chunk) %>%
+	group_split(Chunk,.keep=F)
+	
+commuteTimes <- list()
+maxCommutes <- list()
+
+for(i in 1:length(census_centroids_chunks)) {
+	commuteTimes[[i]] <- googleway::google_distance(
+		origins = census_centroids_chunks[[i]],
+		destinations = c(work1, work2),
+		mode = "transit",
+		arrival_time = monday_morning,
+		units = "imperial",
+		transit_routing_preference = "fewer_transfers",
+		traffic_model = "best_guess",
+		key = api
+	)
+
+	maxCommutes[[i]] <- enframe(commuteTimes[[i]]$rows$elements) %>% 
+		unnest(cols=value) %>% 
+		unnest(cols=duration) %>% 
+		dplyr::select(name,value) %>% 
+		mutate(CommuteTime = value/60) %>%
+		group_by(name) %>% 
+		summarize(MaxCommute = max(CommuteTime))
+
+}
+
+```
+
+## Create a binned commute score where the shortest max time in minutes is highest
+
+```{r,echo=F}
+commuteTimes <- readRDS("~/Desktop/GoogleMaps_CommuteTimes_CensusCentroids_Walkability9plus_GreaterBoston_070924.rds")
+maxCommutes <- readRDS("~/Desktop/GoogleMaps_maxCommuteTimes_CensusCentroids_Walkability9plus_GreaterBoston_070924.rds")
+```
+
+```{r}
+maxCommutesFlat <- enframe(maxCommutes) %>% 
+	dplyr::rename("Chunk" = name) %>% 
+	unnest(cols=c(value)) %>%
+	mutate(MaxCommute = round(MaxCommute)) %>%
+	mutate(CommuteScore = case_when(
+		MaxCommute >= 55 ~ 0,
+		MaxCommute >= 45 & MaxCommute < 55 ~ 1,
+		MaxCommute >= 35 & MaxCommute < 45 ~ 2,
+		MaxCommute >= 25 & MaxCommute < 35 ~ 3,
+		MaxCommute < 25 ~ 4
+		)
+	)
+maxCommutesFlat
+
+# Add these scores to our census blocks data matrix
+filtered_blocks <- greaterBoston_censusblocks[greaterBoston_censusblocks$walkabilityScore>=9,]
+filtered_blocks <- filtered_blocks[filtered_blocks$POP20 > 0,]
+filtered_blocks$CommuteScore <- maxCommutesFlat$CommuteScore
+```
+
+## Plot base map then color census blocks by commute score
+
+```{r,eval=F}
+google_map(data=t_stops) %>% 
+	add_transit() %>%
+	add_polygons(data = st_transform(filtered_blocks,crs = 4326), 
+		fill_colour = "CommuteScore",
+		fill_opacity = 0.75,
+		legend = T) 
+```
+
+![](Fig7.png)
+
+# Retrieve MLS listings for each greater Boston town using [HomeHarvest](https://github.com/Bunsly/HomeHarvest)
+
+This is a `python` package that is easy to set up and run; it pulls listings from `Realtor.com` and we create a csv tabulating each Boston-area town's for-sale listings within the last 30 days
+
+```{python, eval=F}
+from homeharvest import scrape_property
+from datetime import datetime
+current_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+Arlington_filename = f"HomeHarvest_Arlington_{current_timestamp}.csv"
+Arlington_properties = scrape_property(
+  location="Arlington, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Arlington_properties.to_csv(Arlington_filename, index=False)
+
+
+Belmont_filename = f"HomeHarvest_Belmont_{current_timestamp}.csv"
+Belmont_properties = scrape_property(
+  location="Belmont, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Belmont_properties.to_csv(Belmont_filename, index=False)
+
+
+Boston_filename = f"HomeHarvest_Boston_{current_timestamp}.csv"
+Boston_properties = scrape_property(
+  location="Boston, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Boston_properties.to_csv(Boston_filename, index=False)
+
+
+Braintree_filename = f"HomeHarvest_Braintree_{current_timestamp}.csv"
+Braintree_properties = scrape_property(
+  location="Braintree, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Braintree_properties.to_csv(Braintree_filename, index=False)
+
+
+Brookline_filename = f"HomeHarvest_Brookline_{current_timestamp}.csv"
+Brookline_properties = scrape_property(
+  location="Brookline, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Brookline_properties.to_csv(Brookline_filename, index=False)
+
+
+Cambridge_filename = f"HomeHarvest_Cambridge_{current_timestamp}.csv"
+Cambridge_properties = scrape_property(
+  location="Cambridge, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Cambridge_properties.to_csv(Cambridge_filename, index=False)
+
+
+Chelsea_filename = f"HomeHarvest_Chelsea_{current_timestamp}.csv"
+Chelsea_properties = scrape_property(
+  location="Chelsea, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Chelsea_properties.to_csv(Chelsea_filename, index=False)
+
+
+Everett_filename = f"HomeHarvest_Everett_{current_timestamp}.csv"
+Everett_properties = scrape_property(
+  location="Everett, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Everett_properties.to_csv(Everett_filename, index=False)
+
+
+Malden_filename = f"HomeHarvest_Malden_{current_timestamp}.csv"
+Malden_properties = scrape_property(
+  location="Malden, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Malden_properties.to_csv(Malden_filename, index=False)
+
+
+Medford_filename = f"HomeHarvest_Medford_{current_timestamp}.csv"
+Medford_properties = scrape_property(
+  location="Medford, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Medford_properties.to_csv(Medford_filename, index=False)
+
+
+Melrose_filename = f"HomeHarvest_Melrose_{current_timestamp}.csv"
+Melrose_properties = scrape_property(
+  location="Melrose, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Melrose_properties.to_csv(Melrose_filename, index=False)
+
+
+Milton_filename = f"HomeHarvest_Milton_{current_timestamp}.csv"
+Milton_properties = scrape_property(
+  location="Milton, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Milton_properties.to_csv(Milton_filename, index=False)
+
+
+Newton_filename = f"HomeHarvest_Newton_{current_timestamp}.csv"
+Newton_properties = scrape_property(
+  location="Newton, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Newton_properties.to_csv(Newton_filename, index=False)
+
+
+Quincy_filename = f"HomeHarvest_Quincy_{current_timestamp}.csv"
+Quincy_properties = scrape_property(
+  location="Quincy, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Quincy_properties.to_csv(Quincy_filename, index=False)
+
+
+Revere_filename = f"HomeHarvest_Revere_{current_timestamp}.csv"
+Revere_properties = scrape_property(
+  location="Revere, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Revere_properties.to_csv(Revere_filename, index=False)
+
+
+Somerville_filename = f"HomeHarvest_Somerville_{current_timestamp}.csv"
+Somerville_properties = scrape_property(
+  location="Somerville, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Somerville_properties.to_csv(Somerville_filename, index=False)
+
+
+Waltham_filename = f"HomeHarvest_Waltham_{current_timestamp}.csv"
+Waltham_properties = scrape_property(
+  location="Waltham, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Waltham_properties.to_csv(Waltham_filename, index=False)
+
+
+Watertown_filename = f"HomeHarvest_Watertown_{current_timestamp}.csv"
+Watertown_properties = scrape_property(
+  location="Watertown, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Watertown_properties.to_csv(Watertown_filename, index=False)
+
+
+Winthrop_filename = f"HomeHarvest_Winthrop_{current_timestamp}.csv"
+Winthrop_properties = scrape_property(
+  location="Winthrop, MA",
+  listing_type="for_sale",
+  past_days=30
+)
+Winthrop_properties.to_csv(Winthrop_filename, index=False)
+
+```
+
+# Read MLS results back into R, then overlay onto our scored census blocks and plot
+
+## Import MLS results
+
+```{r}
+#| warning: false
+#| message: false
+file.list <- list.files(pattern="HomeHarvest_*")
+df.list <- lapply(file.list, function(x){read_csv(x) %>% mutate(mls_id = as.character(mls_id))})
+mls_df <- bind_rows(df.list, .id = "id")
+
+mls_df
+```
+
+## Filter MLS listings 
+
+Here we set a filter for 2-4 bedrooms for sale listed under \$1.5M as an example query
+
+```{r}
+mls_filtered <- mls_df %>%
+	dplyr::filter(status == "FOR_SALE") %>%
+	dplyr::filter(beds >= 2 & beds <=4) %>%
+	dplyr::filter(list_price <= 1500000) %>%
+	dplyr::select(mls_id,property_url,full_street_line,city,zip_code,beds,full_baths,half_baths,sqft,list_price,latitude,longitude)
+
+mls_filtered
+```
+
+## Find intersection between houses for sale and high-scoring census blocks in greater Boston
+
+Require additionally here that the census block has a high commute score
+
+```{r}
+mls_intersection <- mls_filtered %>%
+	sf::st_as_sf(coords = c("longitude","latitude"),crs = 4326) %>%
+	sf::st_intersection(.,st_transform(filtered_blocks[filtered_blocks$CommuteScore>=2,],crs = 4326))
+mls_intersection
+```
+
+## Plot base map showing commute score. Add pins for each listed property
+
+The URL to the underlying MLS listing appears when you click on a pin
+
+```{r,eval=F}
+google_map(data=t_stops) %>% 
+    add_transit() %>%
+    add_polygons(data = st_transform(filtered_blocks,crs = 4326), 
+                 fill_colour = "CommuteScore",
+                 fill_opacity = 0.75,
+                 legend = T) %>%
+    add_markers(data=mls_intersection, title="list_price", info_window="property_url")
+```
+
+![](Fig8.png)
+
+![](Fig9.png)
+
+## Prepare a tsv for export showing the intersecting properties and their various computed features for filtering
+
+```{r}
+mls_intersection_forExport <- mls_intersection %>%
+	as_tibble() %>%
+	dplyr::select(mls_id,
+					property_url,
+					full_street_line,
+					city,
+					zip_code,
+					beds,
+					full_baths,
+					half_baths,
+					sqft,
+					list_price,
+					T_connectivity,
+					nCafes,
+					nRestaurants,
+					nGrocery,
+					nParks,
+					walkabilityScore,
+					CommuteScore
+			)
+mls_intersection_forExport
+
+write_tsv(mls_intersection_forExport,"GoogleMaps_CommuteTimes_CensusCentroids_Walkability9plus_GreaterBoston_OverlappingMLS.tsv")
+```
+
+# Future ideas
+
+-   Incorporate non-MBTA transit routes, e.g. Harvard/MGH/MASCO shuttles
+
+-   Additional filtering criteria per census block
+
+-   Alternative means for routing directions? Want to both minimize transfers and walking if possible, and have clear transit backup options in case of closure, traffic, etc.
