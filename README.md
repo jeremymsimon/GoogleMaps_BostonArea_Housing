@@ -1,6 +1,10 @@
 Using Google Maps via R to explore Greater Boston neighborhood housing
 ================
-Jeremy M. Simon
+Author: Jeremy M. Simon
+
+## HTML of rendered markdown deployed [here](https://jeremymsimon.github.io/GoogleMaps_BostonArea_Housing/GoogleMaps_GreaterBoston_layers.html)
+
+<hr>
 
 - <a href="#background" id="toc-background">Background</a>
 - <a href="#initial-setup" id="toc-initial-setup">Initial setup</a>
